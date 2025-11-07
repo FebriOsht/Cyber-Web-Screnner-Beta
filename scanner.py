@@ -1,271 +1,194 @@
-# scanner.py
-import requests
-from bs4 import BeautifulSoup
-import pprint
-import urllib3
+from flask import Flask, render_template, request, make_response, redirect, url_for # <<-- PERBAIKAN 1: Menambahkan make_response
+import os
+from datetime import datetime
+import math
+from database import init_db, add_scan_result, get_all_scans
 from ssl_scanner import SSLScanner
 from headers_scanner import HeadersScanner
+from scanner import EnhancedScanner
 
-# Disable insecure warnings (karena verify=False dipakai)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+PER_PAGE = 20
+# Tentukan jalur absolut ke folder 'templates'
+# os.path.dirname(os.path.abspath(__file__)) mendapatkan path direktori 'src'
+template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+app = Flask(__name__, template_folder=template_dir) 
 
-# --- MODUL 1: PENGECEKAN HEADER KEAMANAN ---
-def check_security_headers(url, session):
-    headers_to_check = {
-        'Content-Security-Policy': 'Penting untuk mencegah serangan XSS.',
-        'Strict-Transport-Security': 'Memaksa koneksi HTTPS.',
-        'X-Content-Type-Options': 'Mencegah MIME-sniffing.',
-        'X-Frame-Options': 'Mencegah clickjacking.',
-    }
-    found_headers = {}
-    missing_headers = {}
+print("TEMPLATE_FOLDER (Explicitly Set):", app.template_folder)
+
+# =======================
+# HALAMAN UTAMA
+# =======================
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# =======================
+# JALANKAN PEMINDAIAN (langsung tanpa Celery)
+# =======================
+@app.route("/scan", methods=["POST"])
+def scan():
     try:
-        response = session.get(url, timeout=10, verify=False)
-        response_headers = {k: v for k, v in response.headers.items()}
+        url = request.form["url"]
 
-        for header, description in headers_to_check.items():
-            if header in response_headers:
-                found_headers[header] = response_headers[header]
-            else:
-                missing_headers[header] = description
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
 
-        return {'ditemukan': found_headers, 'tidak_ditemukan': missing_headers}
-    except requests.exceptions.RequestException as e:
-        return {'error': f"Tidak dapat terhubung. Error: {e}"}
+        from scanner import run_full_scan
+        result = run_full_scan(url)
 
-# --- MODUL 2: PENCARIAN INFORMASI TEKNOLOGI ---
-def find_tech_info(url, session):
-    tech_info = {}
-    try:
-        response = session.get(url, timeout=10, verify=False)
-        headers = response.headers
+        # Simpan hasil ke database
+        try: # <<< Indentasi diperbaiki
+            # PERBAIKAN LOGIKA: Ambil score dan grade dari 'score_info' (konsisten dengan scanner.py)
+            score = result.get("score_info", {}).get("score", 0)
+            grade = result.get("score_info", {}).get("grade", "N/A")
+            
+            add_scan_result(url, score, grade, result)
+        except Exception as e: # <<< Indentasi diperbaiki
+            print(f"[DB ERROR] {e}") # <<< Indentasi diperbaiki
 
-        if 'Server' in headers:
-            tech_info['Server'] = headers['Server']
-        if 'X-Powered-By' in headers:
-            tech_info['Powered-By'] = headers['X-Powered-By']
+        # Tampilkan hasil di halaman
+        # Menggunakan nama template baru yang sudah disepakati
+        return render_template("scan_result.html", results=result)
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        generator_tag = soup.find('meta', {'name': 'generator'})
-        if generator_tag and 'content' in generator_tag.attrs:
-            tech_info['Generator (CMS)'] = generator_tag['content']
+    except Exception as e:
+        error_type = type(e).__name__
+        error_detail = str(e)
+        
+        # Menggunakan HTML murni untuk menghindari error Jinja2
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Kesalahan Server</title></head>
+        <body>
+            <h1>❌ TERJADI KESALAHAN INTERNAL SERVER (500)</h1>
+            <p><strong>TIPE ASLI:</strong> {error_type}</p>
+            <p><strong>DETAIL ASLI:</strong> {error_detail}</p>
+            <a href="/">Kembali ke Halaman Utama</a>
+        </body>
+        </html>
+        """
+        return make_response(html_content, 500)
 
-        return tech_info
-    except requests.exceptions.RequestException as e:
-        return {'error': f"Tidak dapat mengambil informasi. Error: {e}"}
+# =======================
+# HALAMAN RIWAYAT PEMINDAIAN
+# =======================
+# Definisikan batas data per halaman
+# app.py
 
-# --- MODUL 3: PENGECEKAN ROBOTS.TXT ---
-def check_robots_txt(url, session):
-    robots_url = url.rstrip('/') + "/robots.txt"
-    try:
-        response = session.get(robots_url, timeout=10, verify=False)
-        if response.status_code == 200:
-            paths = [line for line in response.text.splitlines() if line.strip().lower().startswith(('disallow:', 'allow:'))]
-            return {'ditemukan': True, 'paths': paths}
-        else:
-            return {'ditemukan': False, 'status_code': response.status_code}
-    except requests.exceptions.RequestException as e:
-        return {'ditemukan': False, 'error': f"Tidak dapat mengakses robots.txt. Error: {e}"}
-
-# --- MODUL 4: PENGECEKAN DIREKTORI .GIT ---
-def check_exposed_git(url, session):
-    git_url = url.rstrip('/') + "/.git/HEAD"
-    try:
-        response = session.get(git_url, timeout=10, verify=False)
-        if response.status_code in (200, 403):
-            return {'ditemukan': True, 'status_code': response.status_code, 'level_risiko': 'Kritis'}
-        else:
-            return {'ditemukan': False}
-    except requests.exceptions.RequestException:
-        return {'ditemukan': False}
-
-# --- MODUL 6: PENGECEKAN MIXED CONTENT ---
-def check_mixed_content(url, session):
-    mixed_content_list = []
-    try:
-        response = session.get(url, timeout=10, verify=False)
-        if not url.startswith('https://'):
-            return {'ditemukan': False, 'status': 'Bukan situs HTTPS'}
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        for tag in soup.find_all(['img', 'script', 'link']):
-            src = tag.get('src') or tag.get('href')
-            if src and src.startswith('http://'):
-                mixed_content_list.append(src)
-
-        if mixed_content_list:
-            return {'ditemukan': True, 'urls': mixed_content_list, 'level_risiko': 'Menengah'}
-        else:
-            return {'ditemukan': False}
-    except requests.exceptions.RequestException:
-        return {'ditemukan': False, 'error': 'Gagal mengambil halaman'}
-
-# --- MODUL 5: PERHITUNGAN SKOR KEAMANAN ---
-def calculate_security_score(results):
-    score = 100
-    findings_with_recs = []
-
-    # Pengecekan .git
-    if results.get('exposed_git_info', {}).get('ditemukan'):
-        score -= 50
-        findings_with_recs.append({
-            'finding': "Risiko Kritis: Direktori .git terekspos.",
-            'recommendation': "Segera hapus direktori .git dari server hosting Anda."
-        })
-
-    # Header keamanan
-    missing_headers = results.get('security_headers', {}).get('tidak_ditemukan', {})
-    if 'Strict-Transport-Security' in missing_headers:
-        score -= 15
-        findings_with_recs.append({
-            'finding': "Risiko Tinggi: Header Strict-Transport-Security (HSTS) hilang.",
-            'recommendation': "Tambahkan header 'Strict-Transport-Security'."
-        })
-    if 'X-Frame-Options' in missing_headers:
-        score -= 10
-        findings_with_recs.append({
-            'finding': "Risiko Menengah: Header X-Frame-Options hilang.",
-            'recommendation': "Tambahkan header 'X-Frame-Options'."
-        })
-    if 'X-Content-Type-Options' in missing_headers:
-        score -= 10
-        findings_with_recs.append({
-            'finding': "Risiko Menengah: Header X-Content-Type-Options hilang.",
-            'recommendation': "Tambahkan header 'X-Content-Type-Options'."
-        })
-
-    # Teknologi ter-expose
-    tech_info = results.get('technology_info', {})
-    if 'Powered-By' in tech_info and tech_info['Powered-By']:
-        score -= 5
-        findings_with_recs.append({
-            'finding': "Risiko Rendah: Informasi versi PHP (X-Powered-By) terekspos.",
-            'recommendation': "Sembunyikan header 'X-Powered-By'."
-        })
-
-    # Pengecekan Mixed Content (pastikan block ini sebelum return)
-    if results.get('mixed_content_info', {}).get('ditemukan'):
-        score -= 10
-        findings_with_recs.append({
-            'finding': "Risiko Menengah: Ditemukan Mixed Content.",
-            'recommendation': "Pastikan semua aset dimuat lewat HTTPS."
-        })
-
-    # Konversi skor ke grade
-    grade = "A"
-    if score < 60:
-        grade = "F"
-    elif score < 70:
-        grade = "D"
-    elif score < 80:
-        grade = "C"
-    elif score < 90:
-        grade = "B"
-
-    if not findings_with_recs:
-        findings_with_recs.append({
-            'finding': "Konfigurasi Keamanan Baik!",
-            'recommendation': "Tidak ada masalah keamanan dasar yang ditemukan."
-        })
-
-    return {'score': max(0, score), 'grade': grade, 'findings': findings_with_recs}
-
-# --- FUNGSI UTAMA ---
-def run_full_scan(target_url):
-    if not target_url.startswith('http'):
-        target_url = 'https://' + target_url
-
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'MySecurityScanner/1.0'})
-
-    scan_results = {
-        'target': target_url,
-        'security_headers': check_security_headers(target_url, session),
-        'technology_info': find_tech_info(target_url, session),
-        'robots_txt_info': check_robots_txt(target_url, session),
-        'exposed_git_info': check_exposed_git(target_url, session),
-        'mixed_content_info': check_mixed_content(target_url, session)
-    }
-
-    score_data = calculate_security_score(scan_results)
+# ...
+@app.route('/history')
+def history():
+    # 1. Ambil nomor halaman dari URL, default ke 1
+    page = request.args.get('page', 1, type=int) 
     
-    # PERBAIKAN: Masukkan hasil skor ke dalam kunci 'score_info'
-    scan_results["score_info"] = score_data 
+    # 2. Ambil data
+    all_scans = get_all_scans() 
     
-    # CATATAN: Hapus kunci 'score', 'grade', dan 'findings' yang di-update di root jika Anda tidak memerlukannya.
-    # Karena app.py mengharapkan 'score_info', kita hanya menambahkan itu.
+    # KOREKSI: Pastikan all_scans adalah list, jika None, jadikan list kosong.
+    if all_scans is None:
+        all_scans = []
+        
+    total_scans = len(all_scans)
+    offset = (page - 1) * PER_PAGE
+    
+    # Lakukan slicing data untuk halaman saat ini
+    scans_for_page = all_scans[offset:offset + PER_PAGE]
 
-    pprint.pprint(scan_results)
-    return scan_results
+    # Hitung total halaman
+    if total_scans == 0:
+        total_pages = 0
+    else:
+        total_pages = math.ceil(total_scans / PER_PAGE)
+    
+    scans_list = [
+        # ... (list comprehension yang sama)
+        {
+            "id": row["id"],
+            "url": row["url"],
+            "scan_date": row["scan_date"],
+            "score": row["score"],
+            "grade": row["grade"]
+        }
+        for row in scans_for_page # Gunakan scans_for_page
+    ]
+    
+    # Teruskan data pagination ke template
+    return render_template("history.html", 
+                           scans=scans_list,
+                           page=page,
+                           total_pages=total_pages)
 
+# =======================
+# HALAMAN DOKUMENTASI
+# =======================
+@app.route('/docs')
+def docs():
+    return render_template('docs.html', datetime=datetime)
 
+# =======================
+# JALANKAN APP
+# =======================
+
+# Tambahkan routes baru
+@app.route('/api/ssl-scan', methods=['POST'])
+def ssl_scan():
+    data = request.get_json()
+    target = data.get('target')
+    
+    scanner = SSLScanner()
+    results = scanner.check_ssl_certificate(target)
+    
+    # Save to database
+    scan_id = save_scan_result({
+        'type': 'ssl_scan',
+        'target': target,
+        'results': results
+    })
+    
+    return jsonify({
+        'scan_id': scan_id,
+        'results': results
+    })
+
+@app.route('/api/headers-scan', methods=['POST'])  
+def headers_scan():
+    data = request.get_json()
+    target = data.get('target')
+    
+    scanner = HeadersScanner()
+    results = scanner.scan_headers(target)
+    
+    scan_id = save_scan_result({
+        'type': 'headers_scan', 
+        'target': target,
+        'results': results
+    })
+    
+    return jsonify({
+        'scan_id': scan_id,
+        'results': results
+    })
+
+@app.route('/api/comprehensive-scan', methods=['POST'])
+def comprehensive_scan():
+    data = request.get_json()
+    target = data.get('target')
+    
+    scanner = EnhancedScanner()
+    results = scanner.comprehensive_scan(target)
+    
+    scan_id = save_scan_result({
+        'type': 'comprehensive_scan',
+        'target': target, 
+        'results': results
+    })
+    
+    return jsonify({
+        'scan_id': scan_id,
+        'results': results
+    })
 if __name__ == "__main__":
-    target_website = "darmajaya.ac.id"
-    results = run_full_scan(target_website)
-    pprint.pprint(results)
+    init_db()
+    debug_mode = os.environ.get("FLASK_DEBUG", "1") == "1"
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=debug_mode)
 
-class EnhancedScanner:
-    def __init__(self):
-        self.ssl_scanner = SSLScanner()
-        self.headers_scanner = HeadersScanner()
-    
-    def comprehensive_scan(self, target):
-        """Perform comprehensive security scan"""
-        results = {
-            "target": target,
-            "ssl_scan": {},
-            "headers_scan": {},
-            "port_scan": {},
-            "technology_scan": {},
-            "timestamp": None
-        }
-        
-        # SSL Scan
-        try:
-            results["ssl_scan"] = self.ssl_scanner.check_ssl_certificate(target)
-        except Exception as e:
-            results["ssl_scan"] = {"error": str(e)}
-        
-        # Headers Scan  
-        try:
-            results["headers_scan"] = self.headers_scanner.scan_headers(target)
-        except Exception as e:
-            results["headers_scan"] = {"error": str(e)}
-        
-        # TODO: Integrate existing port scanning
-        # TODO: Add technology detection
-        
-        return results
-
-class EnhancedScanner:
-    def __init__(self):
-        self.ssl_scanner = SSLScanner()
-        self.headers_scanner = HeadersScanner()
-    
-    def comprehensive_scan(self, target):
-        """Perform comprehensive security scan"""
-        results = {
-            "target": target,
-            "ssl_scan": {},
-            "headers_scan": {},
-            "port_scan": {},
-            "technology_scan": {},
-            "timestamp": None
-        }
-        
-        # SSL Scan
-        try:
-            results["ssl_scan"] = self.ssl_scanner.check_ssl_certificate(target)
-        except Exception as e:
-            results["ssl_scan"] = {"error": str(e)}
-        
-        # Headers Scan  
-        try:
-            results["headers_scan"] = self.headers_scanner.scan_headers(target)
-        except Exception as e:
-            results["headers_scan"] = {"error": str(e)}
-        
-        # TODO: Integrate existing port scanning
-        # TODO: Add technology detection
-        
-        return results
