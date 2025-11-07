@@ -250,6 +250,31 @@
         <h1 id="title">Cyber Web Scanner 🛡️</h1>
         <p class="lead">Masukkan URL website yang ingin Anda periksa keamanannya.</p>
       </div>
+
+      <!-- Add new scan options -->
+<div class="scan-options">
+    <h3>New Security Scans</h3>
+    
+    <div class="scan-cards">
+        <div class="scan-card">
+            <h4>🔒 SSL/TLS Scanner</h4>
+            <p>Check certificate validity, expiry, and cipher strength</p>
+            <button onclick="runSSLScan()">Run SSL Scan</button>
+        </div>
+        
+        <div class="scan-card">
+            <h4>🛡️ Security Headers Check</h4>
+            <p>Analyze HTTP security headers configuration</p>
+            <button onclick="runHeadersScan()">Run Headers Scan</button>
+        </div>
+        
+        <div class="scan-card">
+            <h4>🔍 Comprehensive Scan</h4>
+            <p>Full security assessment with all scanners</p>
+            <button onclick="runComprehensiveScan()">Run Full Scan</button>
+        </div>
+    </div>
+</div>
     </header>
 
     <form id="scanForm" action="/scan" method="post" novalidate>
@@ -292,6 +317,25 @@
       });
       input.addEventListener('input', ()=>input.setCustomValidity(''));
     })();
+
+    function runSSLScan() {
+    const target = document.getElementById('target').value;
+    fetch('/api/ssl-scan', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({target: target})
+    })
+    .then(response => response.json())
+    .then(data => {
+        displaySSLResults(data.results);
+    });
+}
+
+function displaySSLResults(results) {
+    // Implement results display
+    console.log('SSL Results:', results);
+}
   </script>
 </body>
 </html>
+
